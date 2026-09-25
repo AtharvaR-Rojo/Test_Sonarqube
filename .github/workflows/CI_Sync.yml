@@ -1,0 +1,226 @@
+name: Sync SAP CPI artifacts for SonarQube
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "CPI tenant"
+        required: true
+        type: choice
+        options:
+          - DEV
+          - QA
+      package:
+        description: "Integration package - technical ID or display name"
+        required: true
+        type: string
+      artifact:
+        description: "Integration flow - ID or display name (leave blank for the whole package)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # --- environment variables, set per environment under Settings > Environments ---
+  CPI_API_BASE: ${{ vars.CPI_API_BASE }}      # e.g. https://<tenant>.it-cpi0XX.cfapps.<region>.hana.ondemand.com/api/v1
+  CPI_TOKEN_URL: ${{ vars.CPI_TOKEN_URL }}    # e.g. https://<subdomain>.authentication.<region>.hana.ondemand.com/oauth/token
+
+  # --- repo-level variables (Settings > Secrets and variables > Actions > Variables),
+  # not per-environment: this is where the zip files live, separate from this repo. ---
+  ARTIFACT_REPO: ${{ vars.ARTIFACT_REPO }}         # e.g. myorg/Bmx_Demo
+  ARTIFACT_REPO_REF: ${{ vars.ARTIFACT_REPO_REF }} # branch in that repo to push to; defaults to main below
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    # Pulls the CPI secrets/variables defined for this environment under
+    # Settings > Environments. ARTIFACT_REPO_TOKEN below is a plain repo
+    # secret (not environment-scoped) and is still reachable from here.
+    environment: ${{ inputs.environment }}
+
+    outputs:
+      package_id: ${{ steps.resolve.outputs.package_id }}
+
+    steps:
+      - name: Install tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq unzip
+
+      - name: Request OAuth token
+        id: auth
+        env:
+          # Secrets are passed through the environment, never interpolated into
+          # the script body. Interpolating them inlines the literal value into
+          # the shell source, where a '$' in the secret gets expanded by bash
+          # and the value can leak into the log.
+          CLIENT_ID: ${{ secrets.CPI_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CPI_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+
+          # Credentials come from the service key of the Process Integration Runtime
+          # instance (plan: api). Never hard-code them here.
+          TOKEN=$(curl -sS -f -X POST "$CPI_TOKEN_URL" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "grant_type=client_credentials" \
+            --data-urlencode "client_id=$CLIENT_ID" \
+            --data-urlencode "client_secret=$CLIENT_SECRET" \
+            | jq -r '.access_token')
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Failed to obtain an access token."
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve package and artifact
+        id: resolve
+        env:
+          TOKEN: ${{ steps.auth.outputs.token }}
+          IN_PACKAGE: ${{ inputs.package }}
+          IN_ARTIFACT: ${{ inputs.artifact }}
+        run: |
+          set -euo pipefail
+
+          AUTH=(-H "Authorization: Bearer $TOKEN" -H "Accept: application/json")
+
+          # --- resolve the package: the API path needs the technical Id, but the
+          # user may have typed the display name, so match on either. ---
+          curl -sS -f "${AUTH[@]}" "$CPI_API_BASE/IntegrationPackages" > packages.json
+
+          PKG_ID=$(jq -r --arg q "$IN_PACKAGE" \
+            '[.d.results[] | select(.Id == $q or .Name == $q) | .Id] | first // empty' packages.json)
+
+          if [ -z "$PKG_ID" ]; then
+            echo "::error::No package matches '$IN_PACKAGE'. Available packages:"
+            jq -r '.d.results[] | "  \(.Id)  (\(.Name))"' packages.json
+            exit 1
+          fi
+          echo "Package resolved: $PKG_ID"
+
+          # --- list the artifacts in that package ---
+          curl -sS -f "${AUTH[@]}" \
+            "$CPI_API_BASE/IntegrationPackages('$PKG_ID')/IntegrationDesigntimeArtifacts" \
+            > artifacts.json
+
+          if [ -n "$IN_ARTIFACT" ]; then
+            IDS=$(jq -r --arg q "$IN_ARTIFACT" \
+              '[.d.results[] | select(.Id == $q or .Name == $q) | .Id] | .[]' artifacts.json)
+
+            if [ -z "$IDS" ]; then
+              echo "::error::No artifact matches '$IN_ARTIFACT' in package $PKG_ID. Available:"
+              jq -r '.d.results[] | "  \(.Id)  (\(.Name))"' artifacts.json
+              exit 1
+            fi
+            echo "scope=artifact" >> "$GITHUB_OUTPUT"
+          else
+            IDS=$(jq -r '.d.results[].Id' artifacts.json)
+
+            if [ -z "$IDS" ]; then
+              echo "::warning::Package $PKG_ID contains no integration artifacts."
+            fi
+            echo "scope=package" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Artifacts to sync:"
+          echo "$IDS" | sed 's/^/  /'
+
+          echo "package_id=$PKG_ID" >> "$GITHUB_OUTPUT"
+          {
+            echo "artifact_ids<<EOF"
+            echo "$IDS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout artifact storage repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ARTIFACT_REPO }}
+          ref: ${{ env.ARTIFACT_REPO_REF != '' && env.ARTIFACT_REPO_REF || 'main' }}
+          token: ${{ secrets.ARTIFACT_REPO_TOKEN }}
+          path: artifact-repo
+
+      - name: Download artifact zips into storage repo
+        env:
+          TOKEN: ${{ steps.auth.outputs.token }}
+          PKG_ID: ${{ steps.resolve.outputs.package_id }}
+          SCOPE: ${{ steps.resolve.outputs.scope }}
+          ARTIFACT_IDS: ${{ steps.resolve.outputs.artifact_ids }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+
+          DEST="artifact-repo/cpi/$ENVIRONMENT/$PKG_ID"
+
+          # Whole-package runs rebuild the folder so zips removed in the tenant
+          # also disappear from the storage repo. Single-artifact runs must only
+          # touch their own zip file, or they would wipe their siblings.
+          if [ "$SCOPE" = "package" ]; then
+            rm -rf "$DEST"
+          fi
+          mkdir -p "$DEST"
+
+          for ID in $ARTIFACT_IDS; do
+            echo "--- $ID"
+            ZIP="$DEST/$ID.zip"
+
+            if ! curl -sS -f -H "Authorization: Bearer $TOKEN" \
+                 "$CPI_API_BASE/IntegrationDesigntimeArtifacts(Id='$ID',Version='active')/\$value" \
+                 -o "$ZIP.tmp"; then
+              echo "::warning::Download failed for $ID, skipping."
+              rm -f "$ZIP.tmp"
+              continue
+            fi
+
+            # Sanity-check it's actually a zip before it lands in the storage
+            # repo; sonar-scan is the one that unpacks and filters it.
+            if ! unzip -tqq "$ZIP.tmp" >/dev/null; then
+              echo "::warning::$ID is not a readable zip, skipping."
+              rm -f "$ZIP.tmp"
+              continue
+            fi
+
+            mv "$ZIP.tmp" "$ZIP"
+            echo "    stored $ZIP"
+          done
+
+          echo "Result:"
+          find "$DEST" -type f | sort
+
+      - name: Commit and push to storage repo
+        env:
+          PKG_ID: ${{ steps.resolve.outputs.package_id }}
+          IN_ARTIFACT: ${{ inputs.artifact }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        working-directory: artifact-repo
+        run: |
+          set -euo pipefail
+
+          git config user.name "cpi-sync[bot]"
+          git config user.email "cpi-sync@users.noreply.github.com"
+          git add -A "cpi/$ENVIRONMENT/$PKG_ID"
+
+          if git diff --cached --quiet; then
+            echo "No artifact changes to commit."
+            exit 0
+          fi
+
+          SCOPE_MSG="${IN_ARTIFACT:-all artifacts}"
+          git commit -m "chore(cpi): sync $SCOPE_MSG from $ENVIRONMENT package $PKG_ID"
+          git push
+
+  scan:
+    needs: sync
+    uses: ./.github/workflows/sonar-scan.yml
+    with:
+      artifact_repo: ${{ vars.ARTIFACT_REPO }}
+      artifact_ref: ${{ vars.ARTIFACT_REPO_REF }}
+      path: cpi/${{ inputs.environment }}/${{ needs.sync.outputs.package_id }}
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      ARTIFACT_REPO_TOKEN: ${{ secrets.ARTIFACT_REPO_TOKEN }}
