@@ -1,0 +1,372 @@
+name: SonarQube scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_repo:
+        description: "owner/repo of the zip storage repo (e.g. myorg/Bmx_Demo)"
+        required: true
+        type: string
+      artifact_ref:
+        description: "Branch/ref in the storage repo to read zips from"
+        required: false
+        type: string
+        default: main
+      path:
+        description: "Folder inside the storage repo to scan (e.g. cpi, cpi/DEV, cpi/DEV/<package>)"
+        required: true
+        type: string
+        default: cpi
+      project_key:
+        description: "SonarQube project key"
+        required: true
+        type: string
+        default: Bmx_Demo
+
+  workflow_call:
+    inputs:
+      artifact_repo:
+        required: true
+        type: string
+      artifact_ref:
+        required: false
+        type: string
+        default: main
+      path:
+        required: true
+        type: string
+        default: cpi
+      project_key:
+        required: false
+        type: string
+        default: Bmx_Demo
+    secrets:
+      SONAR_TOKEN:
+        required: true
+      SONAR_HOST_URL:
+        required: true
+      ARTIFACT_REPO_TOKEN:
+        required: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq unzip
+
+      - name: Checkout artifact storage repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.artifact_repo }}
+          ref: ${{ inputs.artifact_ref }}
+          token: ${{ secrets.ARTIFACT_REPO_TOKEN }}
+          path: artifact-src
+
+      # Unpacks every zip found under the requested path into a "cpi/<env>/<package>/<artifact>/..."
+      # tree at the workspace root - the same layout CI_Sync used to commit directly. Nothing here
+      # is committed back; it exists only for this run and is removed in the last step.
+      - name: Extract artifact zips
+        env:
+          SCAN_PATH: ${{ inputs.path }}
+        run: |
+          set -euo pipefail
+
+          SRC="artifact-src/$SCAN_PATH"
+          if [ ! -e "$SRC" ]; then
+            echo "::error::'$SRC' not found in ${{ inputs.artifact_repo }}@${{ inputs.artifact_ref }}"
+            echo "Available folders under artifact-src/cpi/:"
+            find artifact-src/cpi -maxdepth 3 -type d 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+            exit 1
+          fi
+
+          # Extensions SonarQube's XML analyser can read, plus the manifest for
+          # reference. Keep this list in sync with sonar.xml.file.suffixes below.
+          KEEP_EXT="iflw xml xsd xsl mmap prop propdef wsdl edmx"
+          KEEP_NAMES="MANIFEST.MF"
+
+          while IFS= read -r -d '' ZIP; do
+            REL="${ZIP#artifact-src/}"    # cpi/<env>/<package>/<artifact>.zip
+            DEST_DIR="${REL%.zip}"        # cpi/<env>/<package>/<artifact>
+            echo "--- $REL"
+
+            RAW=$(mktemp -d)
+            if ! unzip -qq -o "$ZIP" -d "$RAW"; then
+              echo "::warning::$REL is not a readable zip, skipping."
+              rm -rf "$RAW"
+              continue
+            fi
+
+            mkdir -p "$DEST_DIR"
+
+            FOUND=0
+            while IFS= read -r -d '' FILE; do
+              F_REL="${FILE#$RAW/}"
+              mkdir -p "$DEST_DIR/$(dirname "$F_REL")"
+              cp "$FILE" "$DEST_DIR/$F_REL"
+              FOUND=$((FOUND + 1))
+            done < <(
+              find "$RAW" -type f \( \
+                $(for E in $KEEP_EXT; do printf -- '-iname *.%s -o ' "$E"; done) \
+                $(for N in $KEEP_NAMES; do printf -- '-name %s -o ' "$N"; done) \
+                -false \
+              \) -print0
+            )
+            echo "    extracted $FOUND file(s) to $DEST_DIR"
+
+            # MANIFEST.MF is OSGi plain text, so SonarQube's XML analyser skips
+            # it and no XPath rule can read Bundle-Name. Emit an XML twin next
+            # to it so /manifest/attribute[@name="Bundle-Name"] rules can run.
+            # .xml is already in sonar.xml.file.suffixes, so no scanner change.
+            SRC_MF="$DEST_DIR/META-INF/MANIFEST.MF"
+            if [ -f "$SRC_MF" ]; then
+              {
+                echo '<?xml version="1.0" encoding="UTF-8"?>'
+                echo '<manifest>'
+                awk '
+                  function esc(s) {
+                    gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s)
+                    gsub(/>/, "\\&gt;", s); gsub(/"/, "\\&quot;", s)
+                    return s
+                  }
+                  function emit() {
+                    if (k != "") printf "  <attribute name=\"%s\" value=\"%s\"/>\n", esc(k), esc(v)
+                  }
+                  { sub(/\r$/, "") }                 # CPI writes CRLF
+                  /^[A-Za-z0-9-]+:/ {
+                    emit()
+                    k = substr($0, 1, index($0,":")-1)
+                    v = substr($0, index($0,":")+1); sub(/^[ \t]+/,"",v)
+                    next
+                  }
+                  /^[ \t]/ { l=$0; sub(/^[ \t]/,"",l); v = v l; next }   # OSGi wrap
+                  END { emit() }
+                ' "$SRC_MF"
+                echo '</manifest>'
+              } > "$DEST_DIR/META-INF/manifest.xml"
+              echo "    generated META-INF/manifest.xml"
+            fi
+
+            rm -rf "$RAW"
+          done < <(find "$SRC" -type f -iname '*.zip' -print0)
+
+      - name: Validate path
+        env:
+          SCAN_PATH: ${{ inputs.path }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -e "$SCAN_PATH" ]; then
+            echo "::error::'$SCAN_PATH' contained no extractable zips."
+            exit 1
+          fi
+
+          echo "Files the XML analyser should pick up:"
+          find "$SCAN_PATH" -type f \( \
+            -iname '*.iflw' -o -iname '*.xml' -o -iname '*.xsd' -o -iname '*.xsl' \
+            -o -iname '*.mmap' -o -iname '*.prop' -o -iname '*.propdef' \
+            -o -iname '*.wsdl' -o -iname '*.edmx' \
+          \) | sed 's/^/  /'
+
+      - name: Run SonarScanner
+        uses: sonarsource/sonarqube-scan-action@v2.0.2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ inputs.project_key }}
+            -Dsonar.projectName=${{ inputs.project_key }}
+            -Dsonar.sources=${{ inputs.path }}
+            -Dsonar.sourceEncoding=UTF-8
+            -Dsonar.xml.file.suffixes=.xml,.xsd,.xsl,.iflw,.mmap,.prop,.propdef,.wsdl,.edmx
+
+      # Runs even when the scan step fails, so a broken run still reports why.
+      - name: Publish artifact report
+        if: always()
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          PROJECT_KEY: ${{ inputs.project_key }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f .scannerwork/report-task.txt ]; then
+            echo "## SonarQube CPI Artifact Report" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Scanner produced no report task - the scan step did not complete." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          CE_TASK=$(grep '^ceTaskId=' .scannerwork/report-task.txt | cut -d= -f2)
+          HOST="${SONAR_HOST_URL%/}"
+
+          # SonarQube takes the token as the basic-auth username, password empty
+          auth=(-sS -u "${SONAR_TOKEN}:")
+
+          # --- wait for the compute engine to finish processing the report ---
+          for i in $(seq 1 60); do
+            STATUS=$(curl "${auth[@]}" "$HOST/api/ce/task?id=$CE_TASK" \
+                     | jq -r '.task.status // "UNKNOWN"')
+            case "$STATUS" in
+              SUCCESS|FAILED|CANCELED) break ;;
+            esac
+            [ "$i" = "1" ] && echo "Waiting for analysis $CE_TASK to be processed..."
+            sleep 5
+          done
+          echo "Analysis task status: $STATUS"
+
+          # --- pull issues and the full file inventory ---
+          curl "${auth[@]}" \
+            "$HOST/api/issues/search?componentKeys=$PROJECT_KEY&resolved=false&ps=500" \
+            -o issues.json
+          curl "${auth[@]}" \
+            "$HOST/api/components/tree?component=$PROJECT_KEY&qualifiers=FIL&ps=500" \
+            -o files.json
+          curl "${auth[@]}" \
+            "$HOST/api/qualitygates/project_status?projectKey=$PROJECT_KEY" \
+            -o gate.json || echo '{}' > gate.json
+
+          GATE=$(jq -r '.projectStatus.status // "UNKNOWN"' gate.json)
+
+          # --- build the table -------------------------------------------------
+          # Path layout: cpi/<env>/<package>/<artifact>/src/main/resources/.../x.iflw
+          # Artifacts come from the file inventory so that clean ones are listed
+          # too; issues are then joined onto them by the same env/package/artifact
+          # key. Severity ordering puts BLOCKER first inside a cell.
+          jq -r --arg gate "$GATE" --arg project "$PROJECT_KEY" --arg host "$HOST" '
+            def artifact_key($p):
+              ($p | split("/")) as $s
+              | if ($s | length) >= 4 and $s[0] == "cpi"
+                then { env: $s[1], package: $s[2], artifact: $s[3] }
+                else null end;
+
+            def sev_rank:
+              { "BLOCKER":0, "CRITICAL":1, "MAJOR":2, "MINOR":3, "INFO":4 }[.] // 9;
+
+            ( input                                        # files.json
+              | [ .components[]? | .path // empty ] ) as $paths
+            | ( $paths
+                | map( { p: ., k: artifact_key(.) } )
+                | map(select(.k != null)) ) as $files
+
+            | ( .issues // []
+                | map( (.component | split(":")[1] // .component) as $p
+                       | { p: $p, k: artifact_key($p),
+                           sev: .severity, msg: .message, line: .line } )
+                | map(select(.k != null)) ) as $issues
+
+            | ( $files | map(.k) | unique ) as $artifacts
+
+            | ( $artifacts
+                | map( . as $k
+                  | ( $files
+                      | map(select(.k == $k and (.p | endswith(".iflw"))))
+                      | map(.p | split("/") | last | rtrimstr(".iflw"))
+                      | unique ) as $iflows
+                  | ( $issues | map(select(.k == $k)) ) as $found
+                  | {
+                      env: $k.env,
+                      package: $k.package,
+                      iflow: (if ($iflows | length) > 0
+                              then ($iflows | join(", "))
+                              else $k.artifact end),
+                      status: (if ($found | length) == 0 then "PASS" else "FAIL" end),
+                      analysis: (
+                        if ($found | length) == 0 then "No issues raised"
+                        else
+                          $found
+                          | sort_by(.sev | sev_rank)
+                          | map( "**" + .sev + "** — "
+                                 + (.msg | gsub("\\|"; "\\\\|"))
+                                 + " _(" + (.p | split("/") | last)
+                                 + (if .line then ":" + (.line|tostring) else "" end)
+                                 + ")_" )
+                          | join("<br>")
+                        end)
+                    } ) ) as $rows
+
+            | ( $rows | map(select(.status == "PASS")) | length ) as $passed
+            | ( $rows | length ) as $total
+
+            | "## SonarQube CPI Artifact Report"
+            , ""
+            , "**Project:** `" + $project + "`  "
+            , "**Quality Gate:** " + (if $gate == "OK" then "PASSED" else "FAILED" end) + "  "
+            , "[Open in SonarQube](" + $host + "/dashboard?id=" + $project + ")"
+            , ""
+            , ($total|tostring) + " artifact(s) analysed — **"
+              + ($passed|tostring) + " passed**, **"
+              + (($total-$passed)|tostring) + " failed**"
+            , ""
+            , "| Env | Package | iFlow | Status | Analysis / Why it failed |"
+            , "|---|---|---|---|---|"
+            , ( $rows[]
+                | "| " + (.env // "-")
+                + " | `" + .package
+                + "` | `" + .iflow
+                + "` | " + (if .status == "PASS" then "PASS" else "**FAIL**" end)
+                + " | " + .analysis + " |" )
+          ' issues.json files.json \
+            | grep -v '^null$' \
+            | tee -a "$GITHUB_STEP_SUMMARY" > sonar-report.md
+
+          echo "Report written to the job summary."
+
+      # Diagnostic: shows which @name values actually exist inside each .iflw,
+      # so an interface-ID rule can be targeted at the right element instead of
+      # being guessed at. Safe to delete once the naming rule is settled.
+      - name: Inspect iFlow element names
+        if: always()
+        env:
+          SCAN_PATH: ${{ inputs.path }}
+        run: |
+          set -uo pipefail
+
+          echo "## iFlow Element Names (diagnostic)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Every \`@name\` attribute found inside each .iflw, with whether" \
+            "it carries an interface ID." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r f; do
+            echo "<details><summary><code>$(basename "$f")</code></summary>" \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '| Element | @name | has itf.N |' >> "$GITHUB_STEP_SUMMARY"
+            echo '|---|---|---|' >> "$GITHUB_STEP_SUMMARY"
+
+            # Pull "<element ... name="value"" pairs. grep -o keeps this simple
+            # and avoids needing an XML parser on the runner.
+            grep -oE '<[A-Za-z0-9_:]+[^>]*[[:space:]]name="[^"]*"' "$f" \
+              | sed -E 's/^<([A-Za-z0-9_:]+).*[[:space:]]name="([^"]*)".*$/\1|\2/' \
+              | sort -u \
+              | while IFS='|' read -r elem nm; do
+                  if printf '%s' "$nm" | grep -Eq 'itf\.[0-9]+'; then
+                    mark="yes"
+                  else
+                    mark="-"
+                  fi
+                  echo "| \`$elem\` | \`$nm\` | $mark |" >> "$GITHUB_STEP_SUMMARY"
+                done
+
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          done < <(find "$SCAN_PATH" -type f -name '*.iflw' | sort)
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonar-report
+          path: sonar-report.md
+          if-no-files-found: ignore
+
+      # Nothing extracted here is ever committed anywhere; this just leaves a
+      # clean workspace as requested rather than relying solely on the runner
+      # being ephemeral.
+      - name: Delete extracted files
+        if: always()
+        run: rm -rf cpi artifact-src .scannerwork
