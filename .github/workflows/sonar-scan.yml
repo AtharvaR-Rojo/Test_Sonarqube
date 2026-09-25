@@ -3,17 +3,8 @@ name: SonarQube scan
 on:
   workflow_dispatch:
     inputs:
-      artifact_repo:
-        description: "owner/repo of the zip storage repo (e.g. myorg/Bmx_Demo)"
-        required: true
-        type: string
-      artifact_ref:
-        description: "Branch/ref in the storage repo to read zips from"
-        required: false
-        type: string
-        default: main
       path:
-        description: "Folder inside the storage repo to scan (e.g. cpi, cpi/DEV, cpi/DEV/<package>)"
+        description: "Folder or file to scan (e.g. cpi, cpi/DEV, cpi/DEV/<package>/<artifact>)"
         required: true
         type: string
         default: cpi
@@ -22,134 +13,26 @@ on:
         required: true
         type: string
         default: Bmx_Demo
-
-  workflow_call:
-    inputs:
-      artifact_repo:
-        required: true
-        type: string
-      artifact_ref:
+      name_pattern:
+        description: "Bundle-Name must match this regex (ERE)"
         required: false
         type: string
-        default: main
-      path:
-        required: true
-        type: string
-        default: cpi
-      project_key:
+        default: 'itf\.[0-9]+'
+      naming_warn_only:
+        description: "Report naming violations without failing the build"
         required: false
-        type: string
-        default: Bmx_Demo
-    secrets:
-      SONAR_TOKEN:
-        required: true
-      SONAR_HOST_URL:
-        required: true
-      ARTIFACT_REPO_TOKEN:
-        required: true
+        type: boolean
+        default: true
 
 jobs:
   scan:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install tooling
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq unzip
-
-      - name: Checkout artifact storage repo
+      - name: Check out repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.artifact_repo }}
-          ref: ${{ inputs.artifact_ref }}
-          token: ${{ secrets.ARTIFACT_REPO_TOKEN }}
-          path: artifact-src
-
-      # Unpacks every zip found under the requested path into a "cpi/<env>/<package>/<artifact>/..."
-      # tree at the workspace root - the same layout CI_Sync used to commit directly. Nothing here
-      # is committed back; it exists only for this run and is removed in the last step.
-      - name: Extract artifact zips
-        env:
-          SCAN_PATH: ${{ inputs.path }}
-        run: |
-          set -euo pipefail
-
-          SRC="artifact-src/$SCAN_PATH"
-          if [ ! -e "$SRC" ]; then
-            echo "::error::'$SRC' not found in ${{ inputs.artifact_repo }}@${{ inputs.artifact_ref }}"
-            echo "Available folders under artifact-src/cpi/:"
-            find artifact-src/cpi -maxdepth 3 -type d 2>/dev/null | sed 's/^/  /' || echo "  (none)"
-            exit 1
-          fi
-
-          # Extensions SonarQube's XML analyser can read, plus the manifest for
-          # reference. Keep this list in sync with sonar.xml.file.suffixes below.
-          KEEP_EXT="iflw xml xsd xsl mmap prop propdef wsdl edmx"
-          KEEP_NAMES="MANIFEST.MF"
-
-          while IFS= read -r -d '' ZIP; do
-            REL="${ZIP#artifact-src/}"    # cpi/<env>/<package>/<artifact>.zip
-            DEST_DIR="${REL%.zip}"        # cpi/<env>/<package>/<artifact>
-            echo "--- $REL"
-
-            RAW=$(mktemp -d)
-            if ! unzip -qq -o "$ZIP" -d "$RAW"; then
-              echo "::warning::$REL is not a readable zip, skipping."
-              rm -rf "$RAW"
-              continue
-            fi
-
-            mkdir -p "$DEST_DIR"
-
-            FOUND=0
-            while IFS= read -r -d '' FILE; do
-              F_REL="${FILE#$RAW/}"
-              mkdir -p "$DEST_DIR/$(dirname "$F_REL")"
-              cp "$FILE" "$DEST_DIR/$F_REL"
-              FOUND=$((FOUND + 1))
-            done < <(
-              find "$RAW" -type f \( \
-                $(for E in $KEEP_EXT; do printf -- '-iname *.%s -o ' "$E"; done) \
-                $(for N in $KEEP_NAMES; do printf -- '-name %s -o ' "$N"; done) \
-                -false \
-              \) -print0
-            )
-            echo "    extracted $FOUND file(s) to $DEST_DIR"
-
-            # MANIFEST.MF is OSGi plain text, so SonarQube's XML analyser skips
-            # it and no XPath rule can read Bundle-Name. Emit an XML twin next
-            # to it so /manifest/attribute[@name="Bundle-Name"] rules can run.
-            # .xml is already in sonar.xml.file.suffixes, so no scanner change.
-            SRC_MF="$DEST_DIR/META-INF/MANIFEST.MF"
-            if [ -f "$SRC_MF" ]; then
-              {
-                echo '<?xml version="1.0" encoding="UTF-8"?>'
-                echo '<manifest>'
-                awk '
-                  function esc(s) {
-                    gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s)
-                    gsub(/>/, "\\&gt;", s); gsub(/"/, "\\&quot;", s)
-                    return s
-                  }
-                  function emit() {
-                    if (k != "") printf "  <attribute name=\"%s\" value=\"%s\"/>\n", esc(k), esc(v)
-                  }
-                  { sub(/\r$/, "") }                 # CPI writes CRLF
-                  /^[A-Za-z0-9-]+:/ {
-                    emit()
-                    k = substr($0, 1, index($0,":")-1)
-                    v = substr($0, index($0,":")+1); sub(/^[ \t]+/,"",v)
-                    next
-                  }
-                  /^[ \t]/ { l=$0; sub(/^[ \t]/,"",l); v = v l; next }   # OSGi wrap
-                  END { emit() }
-                ' "$SRC_MF"
-                echo '</manifest>'
-              } > "$DEST_DIR/META-INF/manifest.xml"
-              echo "    generated META-INF/manifest.xml"
-            fi
-
-            rm -rf "$RAW"
-          done < <(find "$SRC" -type f -iname '*.zip' -print0)
+          fetch-depth: 0
 
       - name: Validate path
         env:
@@ -158,7 +41,9 @@ jobs:
           set -euo pipefail
 
           if [ ! -e "$SCAN_PATH" ]; then
-            echo "::error::'$SCAN_PATH' contained no extractable zips."
+            echo "::error::'$SCAN_PATH' does not exist in the repository."
+            echo "Available folders under cpi/:"
+            find cpi -maxdepth 3 -type d 2>/dev/null | sed 's/^/  /' || echo "  (none)"
             exit 1
           fi
 
@@ -314,6 +199,79 @@ jobs:
 
           echo "Report written to the job summary."
 
+      # MANIFEST.MF is OSGi plain text, not XML, so SonarQube's XML analyser
+      # cannot parse it and no XPath rule can ever read Bundle-Name. This check
+      # therefore runs here, where the file is just text.
+      - name: Check Bundle-Name naming convention
+        if: always()
+        env:
+          SCAN_PATH: ${{ inputs.path }}
+          NAME_PATTERN: ${{ inputs.name_pattern }}
+          WARN_ONLY: ${{ inputs.naming_warn_only }}
+        run: |
+          set -uo pipefail
+
+          echo "## Bundle-Name Naming Convention" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pattern: \`$NAME_PATTERN\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Env | Package | Artifact | Bundle-Name | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          pass=0; fail=0; found=0
+
+          while IFS= read -r mf; do
+            found=$((found + 1))
+
+            # Reassemble the header, honouring OSGi continuation lines
+            # (long values wrap onto following lines that begin with a space).
+            # CPI writes these files with CRLF, so strip the trailing \r or it
+            # breaks the markdown table row.
+            name=$(awk '
+              { sub(/\r$/, "") }
+              /^Bundle-Name:/ { v=substr($0, index($0,":")+1); sub(/^[ \t]+/,"",v); c=1; next }
+              c && /^[ \t]/   { l=$0; sub(/^[ \t]/,"",l); v=v l; next }
+              c               { c=0 }
+              END             { print v }
+            ' "$mf")
+
+            # cpi/<env>/<package>/<artifact>/META-INF/MANIFEST.MF
+            rel="${mf#./}"
+            env_name=$(echo "$rel" | cut -d/ -f2)
+            pkg=$(echo "$rel" | cut -d/ -f3)
+            art=$(echo "$rel" | cut -d/ -f4)
+
+            if [ -z "$name" ]; then
+              status="**FAIL** (no Bundle-Name header)"
+              fail=$((fail + 1))
+              echo "::error file=$mf::MANIFEST.MF has no Bundle-Name header"
+            elif printf '%s' "$name" | grep -Eq "$NAME_PATTERN"; then
+              status="PASS"
+              pass=$((pass + 1))
+            else
+              status="**FAIL**"
+              fail=$((fail + 1))
+              echo "::error file=$mf::Bundle-Name '$name' does not match $NAME_PATTERN"
+            fi
+
+            echo "| $env_name | \`$pkg\` | \`$art\` | \`${name:-(missing)}\` | $status |" \
+              >> "$GITHUB_STEP_SUMMARY"
+          done < <(find "$SCAN_PATH" -type f -path '*/META-INF/MANIFEST.MF' | sort)
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$found" = "0" ]; then
+            echo "No MANIFEST.MF found under \`$SCAN_PATH\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "$found artifact(s) checked — **$pass passed**, **$fail failed**" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "$found checked, $pass passed, $fail failed"
+
+          if [ "$fail" -gt 0 ] && [ "$WARN_ONLY" != "true" ]; then
+            exit 1
+          fi
+
       # Diagnostic: shows which @name values actually exist inside each .iflw,
       # so an interface-ID rule can be targeted at the right element instead of
       # being guessed at. Safe to delete once the naming rule is settled.
@@ -363,10 +321,3 @@ jobs:
           name: sonar-report
           path: sonar-report.md
           if-no-files-found: ignore
-
-      # Nothing extracted here is ever committed anywhere; this just leaves a
-      # clean workspace as requested rather than relying solely on the runner
-      # being ephemeral.
-      - name: Delete extracted files
-        if: always()
-        run: rm -rf cpi artifact-src .scannerwork
