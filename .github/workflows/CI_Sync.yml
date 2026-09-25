@@ -20,31 +20,26 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   # --- environment variables, set per environment under Settings > Environments ---
   CPI_API_BASE: ${{ vars.CPI_API_BASE }}      # e.g. https://<tenant>.it-cpi0XX.cfapps.<region>.hana.ondemand.com/api/v1
   CPI_TOKEN_URL: ${{ vars.CPI_TOKEN_URL }}    # e.g. https://<subdomain>.authentication.<region>.hana.ondemand.com/oauth/token
-
-  # --- repo-level variables (Settings > Secrets and variables > Actions > Variables),
-  # not per-environment: this is where the zip files live, separate from this repo. ---
-  ARTIFACT_REPO: ${{ vars.ARTIFACT_REPO }}         # e.g. myorg/Bmx_Demo
-  ARTIFACT_REPO_REF: ${{ vars.ARTIFACT_REPO_REF }} # branch in that repo to push to; defaults to main below
+  TARGET_DIR: cpi/${{ inputs.environment }}   # DEV and QA are kept side by side, never merged
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
-    # Pulls the CPI secrets/variables defined for this environment under
-    # Settings > Environments. ARTIFACT_REPO_TOKEN below is a plain repo
-    # secret (not environment-scoped) and is still reachable from here.
+    # Pulls the secrets and variables defined for this environment under
+    # Settings > Environments. Secret names stay the same; values differ.
     environment: ${{ inputs.environment }}
 
-    outputs:
-      package_id: ${{ steps.resolve.outputs.package_id }}
-
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Install tooling
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq unzip
 
@@ -136,73 +131,119 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Checkout artifact storage repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.ARTIFACT_REPO }}
-          ref: ${{ env.ARTIFACT_REPO_REF != '' && env.ARTIFACT_REPO_REF || 'main' }}
-          token: ${{ secrets.ARTIFACT_REPO_TOKEN }}
-          path: artifact-repo
-
-      - name: Download artifact zips into storage repo
+      - name: Download and filter artifacts
         env:
           TOKEN: ${{ steps.auth.outputs.token }}
           PKG_ID: ${{ steps.resolve.outputs.package_id }}
           SCOPE: ${{ steps.resolve.outputs.scope }}
           ARTIFACT_IDS: ${{ steps.resolve.outputs.artifact_ids }}
-          ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
 
-          DEST="artifact-repo/cpi/$ENVIRONMENT/$PKG_ID"
+          WORK=$(mktemp -d)
+          DEST="$TARGET_DIR/$PKG_ID"
 
-          # Whole-package runs rebuild the folder so zips removed in the tenant
-          # also disappear from the storage repo. Single-artifact runs must only
-          # touch their own zip file, or they would wipe their siblings.
+          # Whole-package runs rebuild the folder so artifacts deleted in the
+          # tenant also disappear from the repo. Single-artifact runs must only
+          # touch their own subfolder, or they would wipe their siblings.
           if [ "$SCOPE" = "package" ]; then
             rm -rf "$DEST"
           fi
           mkdir -p "$DEST"
 
+          # Extensions SonarQube's XML analyser can read, plus the manifest for
+          # reference. Keep this list in sync with sonar.xml.file.suffixes.
+          KEEP_EXT="iflw xml xsd xsl mmap prop propdef wsdl edmx"
+          KEEP_NAMES="MANIFEST.MF"
+
           for ID in $ARTIFACT_IDS; do
             echo "--- $ID"
-            ZIP="$DEST/$ID.zip"
 
+            ZIP="$WORK/$ID.zip"
             if ! curl -sS -f -H "Authorization: Bearer $TOKEN" \
                  "$CPI_API_BASE/IntegrationDesigntimeArtifacts(Id='$ID',Version='active')/\$value" \
-                 -o "$ZIP.tmp"; then
+                 -o "$ZIP"; then
               echo "::warning::Download failed for $ID, skipping."
-              rm -f "$ZIP.tmp"
               continue
             fi
 
-            # Sanity-check it's actually a zip before it lands in the storage
-            # repo; sonar-scan is the one that unpacks and filters it.
-            if ! unzip -tqq "$ZIP.tmp" >/dev/null; then
+            RAW="$WORK/raw/$ID"
+            mkdir -p "$RAW"
+            if ! unzip -qq -o "$ZIP" -d "$RAW"; then
               echo "::warning::$ID is not a readable zip, skipping."
-              rm -f "$ZIP.tmp"
               continue
             fi
 
-            mv "$ZIP.tmp" "$ZIP"
-            echo "    stored $ZIP"
+            # Replace this artifact's folder so renamed or deleted files inside
+            # it do not linger.
+            rm -rf "$DEST/$ID"
+
+            FOUND=0
+            while IFS= read -r -d '' FILE; do
+              REL="${FILE#$RAW/}"
+              mkdir -p "$DEST/$ID/$(dirname "$REL")"
+              cp "$FILE" "$DEST/$ID/$REL"
+              FOUND=$((FOUND + 1))
+            done < <(
+              find "$RAW" -type f \( \
+                $(for E in $KEEP_EXT; do printf -- '-iname *.%s -o ' "$E"; done) \
+                $(for N in $KEEP_NAMES; do printf -- '-name %s -o ' "$N"; done) \
+                -false \
+              \) -print0
+            )
+
+            echo "    kept $FOUND file(s)"
+
+            # MANIFEST.MF is OSGi plain text, so SonarQube's XML analyser skips
+            # it and no XPath rule can read Bundle-Name. Emit an XML twin next
+            # to it so /manifest/attribute[@name="Bundle-Name"] rules can run.
+            # .xml is already in sonar.xml.file.suffixes, so no scanner change.
+            SRC_MF="$DEST/$ID/META-INF/MANIFEST.MF"
+            if [ -f "$SRC_MF" ]; then
+              {
+                echo '<?xml version="1.0" encoding="UTF-8"?>'
+                echo '<manifest>'
+                awk '
+                  function esc(s) {
+                    gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s)
+                    gsub(/>/, "\\&gt;", s); gsub(/"/, "\\&quot;", s)
+                    return s
+                  }
+                  function emit() {
+                    if (k != "") printf "  <attribute name=\"%s\" value=\"%s\"/>\n", esc(k), esc(v)
+                  }
+                  { sub(/\r$/, "") }                 # CPI writes CRLF
+                  /^[A-Za-z0-9-]+:/ {
+                    emit()
+                    k = substr($0, 1, index($0,":")-1)
+                    v = substr($0, index($0,":")+1); sub(/^[ \t]+/,"",v)
+                    next
+                  }
+                  /^[ \t]/ { l=$0; sub(/^[ \t]/,"",l); v = v l; next }   # OSGi wrap
+                  END { emit() }
+                ' "$SRC_MF"
+                echo '</manifest>'
+              } > "$DEST/$ID/META-INF/manifest.xml"
+              echo "    generated META-INF/manifest.xml"
+            fi
           done
+
+          rm -rf "$WORK"
 
           echo "Result:"
           find "$DEST" -type f | sort
 
-      - name: Commit and push to storage repo
+      - name: Commit changes
         env:
           PKG_ID: ${{ steps.resolve.outputs.package_id }}
           IN_ARTIFACT: ${{ inputs.artifact }}
           ENVIRONMENT: ${{ inputs.environment }}
-        working-directory: artifact-repo
         run: |
           set -euo pipefail
 
           git config user.name "cpi-sync[bot]"
           git config user.email "cpi-sync@users.noreply.github.com"
-          git add -A "cpi/$ENVIRONMENT/$PKG_ID"
+          git add -A "$TARGET_DIR"
 
           if git diff --cached --quiet; then
             echo "No artifact changes to commit."
@@ -212,15 +253,3 @@ jobs:
           SCOPE_MSG="${IN_ARTIFACT:-all artifacts}"
           git commit -m "chore(cpi): sync $SCOPE_MSG from $ENVIRONMENT package $PKG_ID"
           git push
-
-  scan:
-    needs: sync
-    uses: ./.github/workflows/sonar-scan.yml
-    with:
-      artifact_repo: ${{ vars.ARTIFACT_REPO }}
-      artifact_ref: ${{ vars.ARTIFACT_REPO_REF }}
-      path: cpi/${{ inputs.environment }}/${{ needs.sync.outputs.package_id }}
-    secrets:
-      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-      ARTIFACT_REPO_TOKEN: ${{ secrets.ARTIFACT_REPO_TOKEN }}
